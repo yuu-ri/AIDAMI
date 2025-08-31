@@ -18,6 +18,10 @@ AIDAMI
 │   │   └── ...
 │   ├── contributing.md        
 │   ├── faq.md                 
+│   ├── logo
+│   │   ├── AIDAMI.jpg
+│   │   ├── AIDAMI.png
+│   │   └── logo-usage.md
 │   └── assets/                
 │       ├── topology-v0.1.png
 │       ├── config-v0.1.png
