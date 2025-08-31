@@ -1,3 +1,6 @@
+The dir tree
+
+```
 AIDAMI
 ├── docs/ 
 │   ├── README.md              
@@ -23,3 +26,4 @@ AIDAMI
 ├── src/                       
 ├── tests/                     
 └── ...
+```
