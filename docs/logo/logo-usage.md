@@ -7,7 +7,7 @@
 
 ## 1. 标志概览
 
-![AIDAMI Logo](../../logo/AIDAMI.png)
+![AIDAMI Logo](<./AIDAMI.jpg>)
 
 **AIDAMI** 标志的特点：
 - 一只**可爱的小老鼠**正在享用**一碗米饭**，代表了品牌故事：
