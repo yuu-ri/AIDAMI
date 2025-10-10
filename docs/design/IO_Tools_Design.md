@@ -1,16 +1,22 @@
-# Part 4: Tools Design
+# Part 4: Tools Design (Revised & Enhanced)
 
 ## Production-Level Design: The AI Virtual Developer Environment
 
-### 1. Executive Summary & Core Principle
+### 1. Executive Summary
 
-To enable an AI agent to perform complex, multi-step tasks like a human developer, we are moving away from a collection of limited, stateless tools. The new core principle is to provide the AI with a **stateful, interactive, and secure virtual environment** for each task.
+To enable an AI agent to perform complex, multi-step tasks like a human developer, we are moving away from a collection of limited, stateless tools. The new core principle is to provide the AI with a **stateful, interactive, and secure virtual environment** for each task. Instead of calling specific tools like `list_files`, the AI will interact with a persistent session within an isolated environment, primarily using a powerful `execute_command` meta-tool. This approach is managed by a new, central **Environment Manager Service (EMS)**.
 
-Instead of calling specific tools like `list_files` or `run_python_script`, the AI will interact with a persistent session within an isolated environment, primarily using a powerful `execute_command` meta-tool. This allows it to clone repositories, create and edit files, install dependencies, and run code in sequence, with the state from one step being available to the next. This approach is managed by a new, central **Environment Manager Service (EMS)**.
+### 2. Design Philosophy: Why This Matters
 
-### 2. High-Level Architecture
+This architecture is founded on a philosophy of emulating a real developer's workflow to unlock higher-level AI capabilities.
 
-The system is composed of three main parts: the existing **Workflow Service** (which orchestrates the process), the new **Environment Manager Service** (which handles the execution environments), and the **Sandboxed Execution Plane** where the work actually happens. The `Plan -> Execute -> Review` loop remains central to ensuring quality and correctness.
+*   **Mimics Expert Workflow**: The `Plan -> Act -> Test -> Iterate` loop within a persistent environment mirrors how human developers solve problems.
+*   **Enables Long-Horizon Reasoning**: Stateful context retention is critical. The AI can create a file in step 1, test it in step 5, and debug it in step 7 without losing state, which is impossible with stateless tools.
+*   **Drives Measurable Autonomy**: Success is not just task completion, but the ability to recover from errors, adapt plans, and operate with less human intervention. This stateful model provides the foundation for such autonomy.
+
+### 3. High-Level Architecture
+
+The system is composed of the **Workflow Service** (orchestrator), the new **Environment Manager Service (EMS)**, and the **Sandboxed Execution Plane**. The architecture is designed for resilience, incorporating patterns like state checkpointing and circuit breakers between services.
 
 ```mermaid
 graph TD
@@ -42,95 +48,126 @@ graph TD
 
     %% EMS Internal Flow %%
     API -- "Manages Environments" --> EM
-    EM -- "Tracks State" --> DB
+    EM -- "Tracks State & Checkpoints" --> DB
     EM -- "Controls (Docker/K8s)" --> Env1
-
 ```
 
-### 3. Component Deep Dive
+### 4. Component Deep Dive
 
-#### 3.1. Environment Manager Service (EMS)
+#### 4.1. Environment Manager Service (EMS)
 
-This new microservice is the heart of the execution plane. It is responsible for the complete lifecycle and secure interaction with the sandboxed environments.
+This new microservice is the heart of the execution plane, responsible for the complete lifecycle and secure interaction with the sandboxed environments.
 
 **Responsibilities:**
 
 *   **Lifecycle Management**:
-    *   `POST /environments`: Creates a new, clean Docker container environment for a task. Returns a unique `environment_id`.
-    *   `DELETE /environments/{environment_id}`: Destroys the environment and cleans up all associated resources (container, volumes).
-    *   `POST /environments/{environment_id}/heartbeat`: Extends the environment's lifespan, preventing cleanup of active sessions.
-*   **Interaction API**:
-    *   `POST /environments/{environment_id}/execute`: Executes a shell command within the container.
-    *   `POST /environments/{environment_id}/files/write`: Writes content to a file.
-    *   `GET /environments/{environment_id}/files/read`: Reads content from a file.
+    *   `POST /environments`: Creates a new environment from a template (e.g., 'python-dev', 'node-dev'). Returns `environment_id`.
+    *   `DELETE /environments/{id}`: Destroys the environment and all associated resources.
+    *   `POST /environments/{id}/heartbeat`: Extends the environment's lifespan.
+*   **State Management & Recovery**:
+    *   `POST /environments/{id}/snapshot`: Creates a point-in-time snapshot of the `/workspace` volume.
+    *   `POST /environments/{id}/rollback`: Restores the workspace from the latest snapshot.
+*   **Interaction & Observability API**:
+    *   `POST /environments/{id}/execute`: Executes a shell command.
+    *   `POST /environments/{id}/files/write`: Writes content to a file.
+    *   `GET /environments/{id}/files/read`: Reads content from a file.
+    *   `GET /environments/{id}/debug_state`: Returns comprehensive environment info (packages, processes, disk usage).
 *   **Security & Resource Management**:
-    *   Applies strict resource limits (CPU, memory, execution time) to every container.
-    *   Enforces network policies (e.g., allow public internet, block internal network).
-    *   Manages ephemeral state and automatic cleanup of inactive environments.
+    *   Applies **dynamic resource limits** (CPU, memory, disk space) based on the task profile.
+    *   Enforces network policies and manages a **secure secret injection** mechanism.
+    *   Manages a queue for concurrent environment requests to prevent overload.
 
-#### 3.2. The Sandboxed Environment
+#### 4.2. The Sandboxed Environment
 
-Each environment is a dedicated, short-lived Docker container with the following characteristics:
+Each environment is a dedicated, short-lived Docker container.
 
-*   **Isolation**: Full process, filesystem, and network isolation via containerization.
-*   **Base Image**: A standard image (e.g., from `ubuntu:22.04`) pre-loaded with a common developer toolchain (`git`, `python3`, `pip`, `node`, `npm`, `build-essential`, `tree`).
-*   **Stateful Workspace**: Each container mounts a unique, dedicated volume at `/workspace`. This directory is the AI's working area and persists for the duration of the task, allowing state to be carried between steps.
-*   **Ephemeral Nature**: The entire container and its workspace volume are destroyed by the EMS upon task completion or timeout. No state persists between different workflow runs.
-*   **Unprivileged**: Containers are always run as a non-root user (`appuser`) without privileged access.
+*   **Isolation**: Full process, filesystem, and network isolation.
+*   **Base Image**: Created from pre-built templates (e.g., `python-dev:3.10`) with a common toolchain (`git`, `python`, `pip`, etc.) to reduce setup time.
+*   **Stateful Workspace**: A unique, dedicated volume at `/workspace` persists for the task's duration.
+*   **Ephemeral Nature**: The container and its volume are destroyed by the EMS upon task completion, timeout, or failure.
+*   **Unprivileged**: Runs as a non-root user (`appuser`) without privileged access.
 
-#### 3.3. The Workflow Service (Updated Roles)
+#### 4.3. The Workflow Service (Updated Roles)
 
-*   **Planner Activity**: Its role is elevated. Instead of choosing from many simple tools, it now creates sophisticated, script-like plans using a few powerful "meta-tools" to interact with its environment.
-*   **Executor Activity**: Acts as the client for the EMS. It receives the plan and orchestrates the API calls to create the environment and execute each step. It is responsible for compiling the detailed execution log.
-*   **Reviewer Activity**: Its role is more critical than ever. It validates the final output produced by the AI's complex sequence of operations against the original request. It inspects the execution log for errors (`exit_code != 0`) and provides detailed feedback to the Planner for revisions.
+*   **Planner Activity**: Generates sophisticated, script-like plans using the powerful meta-tools. Can now incorporate error-handling steps like taking snapshots or checking environment health.
+*   **Executor Activity**: The primary client for the EMS. Implements retry logic with exponential backoff for transient EMS API failures. It orchestrates API calls and compiles the detailed execution log.
+*   **Reviewer Activity**: Inspects the final output and the execution log for errors (`exit_code != 0`), providing detailed feedback for revisions.
 
-### 4. The New "Meta-Tools" for the Planner AI
+### 5. The Planner's Meta-Tools
 
-The Planner's tool catalog is simplified and made vastly more powerful. These are the primary tools it will use.
+The Planner's tool catalog is simplified for power and flexibility.
 
----
+#### 5.1. Core Meta-Tools
 
-**Tool: `environment.execute_command`**
-*   **Description**: Executes any shell command within the secure, stateful environment. This is the primary tool for all actions like listing files, running scripts, using git, etc. Maintains a persistent working directory and state for the lifetime of the environment.
-*   **Inputs Schema**: `{"command": "The full shell command to execute.", "timeout_seconds": 60}`
-*   **Output Description**: Returns `{'error': bool, 'stdout': str, 'stderr': str, 'exit_code': int}`. `error` is true if the exit code is not 0.
+*   **`environment.execute_command`**
+    *   **Description**: Executes any shell command within the secure, stateful environment. This is the primary tool for all actions.
+    *   **Inputs Schema**: `{"command": "The full shell command.", "timeout_seconds": 60}`
+    *   **Output**: `{'error': bool, 'stdout': str, 'stderr': str, 'exit_code': int}`
+*   **`environment.write_file`**
+    *   **Description**: Creates or overwrites a file with the provided content.
+    *   **Inputs Schema**: `{"path": "Relative path within the workspace.", "content": "The full file content."}`
+    *   **Output**: `{'error': bool, 'message': 'Success or error message.'}`
+*   **`environment.read_file`**
+    *   **Description**: Reads the entire content of a file from the workspace.
+    *   **Inputs Schema**: `{"path": "The relative path of the file to read."}`
+    *   **Output**: `{'error': bool, 'content': 'File content or error message.'}`
 
-**Tool: `environment.write_file`**
-*   **Description**: Creates or overwrites a file with the provided content. Useful for creating Python scripts, shell scripts, or configuration files that will be executed later.
-*   **Inputs Schema**: `{"path": "The relative path within the workspace (e.g., 'src/main.py').", "content": "The full content of the file."}`
-*   **Output Description**: Returns `{'error': bool, 'message': 'File saved successfully.' or 'Error message'}`.
+#### 5.2. Extended & Specialized Meta-Tools
 
-**Tool: `environment.read_file`**
-*   **Description**: Reads the entire content of a file from the workspace. Use this to inspect code, view logs, or get the output of a script that writes to a file.
-*   **Inputs Schema**: `{"path": "The relative path of the file to read."}`
-*   **Output Description**: Returns `{'error': bool, 'content': 'The file content' or 'Error message'}`.
+These provide safer, more abstract ways to perform common, complex operations.
 
----
-### 5. Revised Workflow Logic
+*   **`environment.install_dependencies`**
+    *   **Description**: Intelligently and safely installs dependencies based on manifest files (`requirements.txt`, `package.json`). Uses an internal allowlist to prevent malicious package installation.
+    *   **Inputs Schema**: `{"auto_detect": true}`
+    *   **Output**: `{'error': bool, 'stdout': 'Log of installation process.'}`
+*   **`environment.execute_script`**
+    *   **Description**: Executes a multi-line script with a specified interpreter, handling temporary file creation and cleanup automatically.
+    *   **Inputs Schema**: `{"script": "Multi-line script content.", "interpreter": "bash|python|node"}`
+    *   **Output**: `{'error': bool, 'stdout': str, 'stderr': str, 'exit_code': int}`
+*   **`environment.snapshot_state`**
+    *   **Description**: Creates a named snapshot of the current workspace. The Planner should use this before attempting risky operations.
+    *   **Inputs Schema**: `{"snapshot_name": "A descriptive name for the checkpoint."}`
+    *   **Output**: `{'error': bool, 'message': 'Snapshot created successfully.'}`
 
-A task is now processed as a "session" within a dedicated environment.
+### 6. Revised Workflow Logic
 
-1.  **Provision (Start of Workflow)**: The Executor calls the EMS (`POST /environments`) to create a new, clean sandboxed environment. The returned `environment_id` is stored in the workflow's state.
-2.  **Plan**: The Planner generates a sequence of steps using the meta-tools.
-    *   *Example Plan*:
-        1.  `execute_command(command="git clone <repo_url>")`
-        2.  `write_file(path="<repo>/new_script.py", content="...")`
-        3.  `execute_command(command="pip install pandas")`
-        4.  `execute_command(command="python <repo>/new_script.py")`
-3.  **Execute**: The Executor iterates through the plan, calling the EMS API for each step (e.g., `POST /environments/{id}/execute`) and compiling the results into a log.
-4.  **Review**: The complete execution log is passed to the Reviewer. The Reviewer checks for non-zero exit codes and verifies if the final output (e.g., the `stdout` of the last command) satisfies the user's request.
+1.  **Provision**: The Executor calls the EMS (`POST /environments`) to create a new environment, possibly from a specific template. The `environment_id` is stored in the workflow state.
+2.  **Plan**: The Planner generates a sequence of steps. *Example: `snapshot_state`, then `execute_command` to apply changes, then `execute_script` to run tests.*
+3.  **Execute**: The Executor iterates the plan, calling the EMS API for each step and compiling results into a structured log with correlation IDs.
+4.  **Review**: The log is passed to the Reviewer. It checks for non-zero exit codes and verifies if the final output satisfies the request.
 5.  **Decide & Loop**:
-    *   If **Approved**, the workflow proceeds to the final step.
-    *   If **Revise**, the Reviewer's feedback and the execution log are passed back to the Planner for the next iteration.
-6.  **De-provision (End of Workflow)**: A `finally` block in the workflow logic ensures that a final activity is called to instruct the EMS to destroy the environment (`DELETE /environments/{id}`), guaranteeing no resources are leaked.
+    *   **Approved**: The workflow proceeds to the final step.
+    *   **Revise**: The Reviewer's feedback, the execution log, and the last known good snapshot ID are passed back to the Planner for the next iteration. The Executor can then roll back the environment if needed.
+6.  **De-provision**: A `finally` block in the workflow logic guarantees a final activity is called to destroy the environment (`DELETE /environments/{id}`), ensuring no resources are leaked.
 
-### 6. Security: A Paramount Concern
+### 7. Security: A Defense-in-Depth Model
 
-Granting full shell access necessitates a defense-in-depth security model managed by the EMS.
+Full shell access necessitates a multi-layered security model managed centrally by the EMS.
 
-1.  **Strict Isolation**: Containerization (Docker) is the baseline. For higher security needs, kernel-level isolation with gVisor or microVMs can be used.
-2.  **Network Policies**: Environments have no access to the internal corporate network. Egress to the public internet can be enabled or disabled per task.
-3.  **Resource Limits**: Strict CPU, memory, and execution time limits are enforced on every environment to prevent resource exhaustion and DoS attacks.
-4.  **Ephemeral and Immutable**: Environments are disposable and created from a read-only base image. Only the `/workspace` volume is writable. All state is destroyed after the task.
-5.  **Least Privilege**: Containers run as a non-root user without any special privileges.
-6.  **Audit Logging**: Every command executed in every environment is centrally logged for security analysis and traceability.
+1.  **Strict Isolation**: Containerization is the baseline. Kernel-level isolation (gVisor) is an option for high-risk tasks.
+2.  **Network Policies**: Environments use network profiles: **`offline`** (default), **`read-only-internet`**, or **`full-internet`**, with no access to the internal network.
+3.  **Resource Limits**: Strict and dynamic CPU, memory, and disk space limits are enforced.
+4.  **Ephemeral and Immutable**: Environments are disposable and created from a read-only base image.
+5.  **Least Privilege**: Containers run as a non-root user. Read-only mounts are used for accessing existing codebases.
+6.  **Secure Secret Management**: The EMS injects secrets (e.g., API keys) as temporary environment variables from a secure vault, never exposing them in command history or logs.
+7.  **Command Auditing & Sanitization**: All commands are logged. A validation layer can block high-risk commands (e.g., `sudo`) before execution.
+
+### 8. Production-Grade Enhancements
+
+*   **Resilience & Recovery**:
+    *   **Checkpointing**: The EMS supports workspace snapshotting, enabling the workflow to roll back to a known good state.
+    *   **Circuit Breaker**: A circuit breaker between the Workflow Service and EMS prevents cascading failures.
+*   **Observability & Debugging**:
+    *   **Structured Logging**: All logs are JSON-formatted with correlation IDs linking the workflow, EMS, and container logs.
+    *   **Key Metrics**: The EMS will track and expose metrics for creation times, command duration, error rates, and resource utilization for monitoring and alerting.
+*   **Scalability & Performance**:
+    *   **Container Pooling**: The EMS maintains a pool of pre-warmed base containers to minimize cold-start latency.
+    *   **Queuing System**: A priority queue manages concurrent environment requests, ensuring graceful performance under load.
+
+### 9. Developer Experience & Testing
+
+*   **EMS CLI**: A command-line interface (`ems-cli`) will be developed for developers to manually create, inspect, and interact with environments for easier debugging and tool development.
+*   **Testing Strategy**:
+    *   **Integration Suite**: Automated tests exercising the full `Plan -> Execute -> Review` loop.
+    *   **Chaos Engineering**: Randomly inject failures (e.g., container crashes, network drops) to test system resilience.
+    *   **Security Testing**: Regular penetration testing of the sandboxed environments.
