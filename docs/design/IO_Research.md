@@ -1,147 +1,158 @@
-## Part 4 Addendum: The Dynamic Knowledge & Adaptation Layer
+### **Part 4: The Dynamic Knowledge & Adaptation Layer**
 
-To solve the problem of changing SDKs, we introduce a new service and a new meta-tool that allow the AI to **dynamically research and learn API documentation at runtime**. This turns the AI from a static tool-user into a self-sufficient learner.
+This document incorporates reviewer feedback to enhance the design of the "Librarian" service and the self-correcting workflow. The core "Fail → Research → Adapt" loop is strengthened with proactive version detection, smarter triggers, and greater resilience.
 
-### 1. New Service: The "Librarian" (Documentation & Knowledge Service)
+### 1. The "Librarian" Service (Enhanced)
 
-The Librarian service is responsible for ingesting, indexing, and providing on-demand access to technical documentation for any SDK, API, or framework the AI might need. It acts as the AI's "Google" or "Stack Overflow" for API usage.
+The Librarian service remains the central knowledge repository, but its design is updated for production-grade reliability and precision.
 
-#### 1.1. High-Level Architecture Integration
+#### 1.1. High-Level Architecture with Version Awareness
 
-The Librarian service integrates with the existing Vector DB and provides a new tool for the Planner.
+The architecture now explicitly includes a version detection flow, ensuring that research queries are as specific as possible.
 
 ```mermaid
 graph TD
-    %% Subgraph Grouping
     subgraph Intelligent_Office[Intelligent Office]
-        WS[Workflow Service]
+        Orchestrator[Workflow Orchestrator]
+        Planner[Planner Activity]
+        Executor[Executor Activity]
         EMS[Environment Manager Service]
         LS[Librarian Service]
         VDB[(Vector DB)]
     end
-    
     subgraph External_World[External World]
-        SDK_Docs_Git[SDK Docs Git Repo]
-        SDK_Docs_Web[SDK Docs Website]
+        SDK_Docs[SDK Docs - Git, Websites]
     end
-    
-    %% Data Ingestion Flow
-    SDK_Docs_Git -->|1. Fetch| LS
-    SDK_Docs_Web -->|1. Fetch| LS
-    LS -->|2. Parse, Chunk, Embed| VDB
-    
-    %% Runtime Query Flow
-    WS -->|Planner needs info| LS
-    LS -->|3. Semantic Search| VDB
-    VDB -->|4. Returns relevant docs| LS
-    LS -->|5. Responds to Planner| WS
+    %% Ingestion Flow
+    SDK_Docs -->|1. Fetch & Parse| LS
+    LS -->|2. Chunk, Embed, Index| VDB
+    %% Runtime Self-Correction Flow
+    Orchestrator -->|Task: Use SDK| Planner
+    Planner -->|Plan with static knowledge| Executor
+    Executor -->|Executes command via EMS| EMS
+    EMS -->|Command FAILS - stderr| Executor
+    Executor -->|Reports failure to Planner| Planner
+    Planner -->|A. Query SDK version from environment| Executor
+    Executor -->|B. Returns 'v2.15.0'| Planner
+    Planner -->|C. Research with version context| LS
+    LS -->|D. Semantic search on VDB - filtered by version| VDB
+    VDB -->|E. Returns relevant docs for v2.15.0| LS
+    LS -->|F. Provides corrected usage| Planner
+    Planner -->|G. Generates revised plan| Orchestrator
 ```
 
-#### 1.2. The Ingestion Pipeline (How the Librarian Learns)
+#### 1.2. Enhanced Ingestion Pipeline and Data Model
 
-This is an asynchronous, scheduled process that keeps the knowledge base up-to-date.
+To improve the quality and relevance of research, the Librarian's data model is enriched:
 
-1.  **Source Connectors**: The Librarian has connectors to pull documentation from various sources (e.g., Git repositories containing Markdown, public websites with API references).
-2.  **Fetch & Parse**: It regularly fetches the latest documentation. It uses parsers (e.g., `Unstructured.io`) to extract clean text and code blocks from HTML, Markdown, or reStructuredText.
-3.  **Semantic Chunking**: The parsed content is chunked intelligently, not by fixed size, but by logical sections (e.g., one chunk per function, class, or CLI command).
-4.  **Embed & Index**: Each chunk is converted into a vector embedding and stored in the **Vector DB**. Crucially, it's stored with rich metadata:
-    *   `sdk_name`: (e.g., `aws-cli`, `kubernetes-python-client`)
-    *   `sdk_version`: (e.g., `2.15.0`, `29.0.0`)
-    *   `entity_name`: (e.g., `s3api put-object`, `CoreV1Api.create_namespaced_pod`)
-    *   `source_url`: A direct link to the original documentation page.
+*   **Richer Metadata**: Each chunk in the Vector DB will be indexed with:
+    *   `sdk_name`, `sdk_version`
+    *   `entity_name` (e.g., function or class name)
+    *   `source_url`
+    *   **`last_fetched_at`**: Timestamp for when the source was last pulled.
+    *   **`embedding_model_version`**: The version of the embedding model used, to track and manage embedding drift over time.
+    *   **`failure_context` (Future)**: Store anonymized `stderr` and `command` snippets from real failures to create a feedback loop, enabling the system to learn which documents resolve specific errors.
+*   **Source Freshness**: During retrieval, the Librarian can prioritize documents with a more recent `last_fetched_at` timestamp if conflicting information exists across versions.
+*   **Security & Reproducibility**: The Librarian's external web scrapers will run in a sandboxed environment with rate limiting. For critical SDKs, it will prioritize fetching from mirrored Git repositories to ensure stability and reproducibility.
 
-### 2. The Planner's New Meta-Tool: The "Research Assistant"
+### 2. The Planner's "Research Assistant" Tool (Enhanced)
 
-The Planner gains a new, powerful tool to query the Librarian service.
+The `research_api_usage` tool remains the primary interface, now with a more robust output schema.
 
 *   **`research_api_usage`**
-    *   **Description**: Queries the internal knowledge base for up-to-date documentation on how to use a specific SDK, CLI tool, or API. This should be used when a command fails with an unknown argument or syntax error, suggesting the tool's API has changed since the model's training.
-    *   **Inputs Schema**:
-        ```json
-        {
-          "sdk_name": "The name of the SDK or tool (e.g., 'aws-cli', 'kubectl').",
-          "query": "A natural language question about the task (e.g., 'how to upload a file to s3 with server-side encryption').",
-          "version": "Optional specific version to query."
-        }
-        ```
-    *   **Output**:
+    *   **Description**: Queries the internal knowledge base for up-to-date documentation on how to use a specific SDK, CLI tool, or API. It is triggered by specific failure patterns or when the Planner lacks confidence.
+    *   **Inputs Schema**: `{"sdk_name": str, "query": str, "version": "Optional[str]"}`
+    *   **Output Schema (Enhanced)**:
         ```json
         {
           "error": false,
-          "summary": "An LLM-generated summary of the best approach based on the findings.",
+          "summary": "An LLM-generated summary of the best approach...",
+          "confidence_score": 0.95, // Planner's confidence in this summary
           "snippets": [
             {
-              "content": "The full text of the relevant documentation chunk.",
+              "content": "Relevant documentation chunk.",
               "source_url": "URL to the original documentation.",
-              "score": 0.92
+              "sdk_version": "2.15.0",
+              "score": 0.92 // Retrieval relevance score
             }
+          ],
+          "fallback_suggestions": [ // Populated if confidence is low or no docs are found
+              "Try query with version='latest'",
+              "Verify the 'sdk_name' is correct",
+              "Escalate to human for manual documentation review"
           ]
         }
         ```
 
-### 3. The New Self-Correcting Workflow: Plan → Act → **Fail → Research → Adapt**
+### 3. The Enhanced Self-Correcting Workflow: A Deeper Look
 
-This new capability transforms the workflow into a resilient, adaptive loop.
+The "Fail → Research → Adapt" loop is now more intelligent, proactive, and efficient.
 
-**Scenario**: The AI is tasked to "Upload `report.csv` to the `my-bucket` S3 bucket." The AI's internal knowledge from its training is to use `aws s3 cp`. However, a new company policy requires a specific, non-standard tag, which the old command syntax doesn't support well.
+#### 3.1. Intelligent Research Triggers
 
-1.  **Initial Plan**: The Planner, based on its static knowledge, generates a plan:
-    *   Step 1: `create_environment`
-    *   Step 2: `execute_command(command="aws s3 cp report.csv s3://my-bucket/")`
-    *   ...
-    *   Step N: `destroy_environment`
+The decision to call `research_api_usage` is no longer a simple failure check. The Reviewer/Orchestrator uses a rule-based system to identify correctable errors:
+```json
+// Example trigger logic
+{
+  "trigger_conditions": [
+    "exit_code != 0 AND (stderr contains 'unknown option' OR stderr contains 'invalid argument')",
+    "stderr contains 'is deprecated' OR stderr contains 'will be removed'",
+    "exit_code == 127 OR stderr contains 'command not found' (suggests tool might be renamed)"
+  ]
+}
+```
 
-2.  **Execute & Fail**: The Executor runs the command in the sandboxed environment. The command fails because the AWS CLI is a newer version that requires different arguments for tagging, or a security policy blocks the call. The EMS returns:
-    *   `exit_code: 254`
-    *   `stderr: "Error: Invalid argument for --tagging..."`
+#### 3.2. Proactive Version Detection
 
-3.  **Review & Trigger Research**: The Reviewer sees the non-zero exit code. Instead of immediately failing, its logic (and the orchestrator's) identifies this as a potential API mismatch. It sends feedback to the Planner:
-    *   **Revision Feedback**: "The command `aws s3 cp` failed with an invalid argument error. The SDK may have changed. Research the correct usage for uploading a file to S3 with tags using the `research_api_usage` tool."
-
-4.  **Research & Adapt (The Magic Step)**: The Planner starts a new planning cycle with this feedback.
-    *   **New Plan Step 1**: `research_api_usage(sdk_name="aws-cli", query="how to upload a file to s3 with tags")`.
-    *   The Librarian service searches the Vector DB and returns documentation snippets for the `aws s3api put-object` command, which is more flexible.
-    *   **New Plan Step 2**: The Planner analyzes the research results and generates a *corrected* command: `execute_command(command="aws s3api put-object --bucket my-bucket --key report.csv --body report.csv --tagging 'TagSet=[{Key=compliance,Value=strict}]'")`.
-
-5.  **Execute & Succeed**: The Executor runs the new, correct command, and it succeeds.
-
-6.  **Final Review**: The workflow proceeds, and the Reviewer now sees a successful execution log (`exit_code: 0`) and approves the task.
-
-### 4. End-to-End Self-Correction Sequence Diagram
+This is the most critical enhancement. Instead of guessing the version, the Planner actively verifies it.
 
 ```mermaid
 sequenceDiagram
-    participant O as Orchestrator
     participant P as Planner
     participant E as Executor
-    participant EMS as Env. Manager
     participant L as Librarian
 
-    O->>P: Generate plan for "Upload file to S3 with tags"
-    P-->>O: Plan with `aws s3 cp` (old knowledge)
-    O->>E: Execute plan
-    E->>EMS: execute_command("aws s3 cp ...")
-    EMS-->>E: FAILED (exit_code=254, stderr="invalid arg")
-    E-->>O: Execution failed with error log
-
-    O->>P: Request Revision (Feedback: "Command failed, research the API")
-    P->>L: research_api_usage(sdk="aws-cli", query="upload file with tags")
-    L-->>P: Docs for `aws s3api put-object`
-
-    P-->>O: New, corrected plan using `aws s3api put-object`
-    O->>E: Execute revised plan
-    E->>EMS: execute_command("aws s3api put-object ...")
-    EMS-->>E: SUCCESS (exit_code=0)
-    E-->>O: Execution successful
-    O->>O: Mark task complete
+    E->>P: Command failed (stderr indicates potential API mismatch)
+    P->>E: Execute command to get version (e.g., `aws --version`)
+    E-->>P: Command output: `aws-cli/2.15.0`
+    
+    P->>L: research_api_usage(sdk="aws-cli", version="2.15.0", query="...")
+    L-->>P: Returns version-specific documentation
+    P->>P: Generates a corrected plan based on precise docs
 ```
 
-### 5. Conclusion: From Static Agent to Dynamic Developer
+#### 3.3. Session-Level Caching for Efficiency
 
-By integrating the **Librarian Service** and the `research_api_usage` tool, the system transcends the limitations of a static AI model. It gains the ability to:
+To prevent redundant research calls within a single, complex task, the Orchestrator maintains a session-level cache in its workflow state.
 
-*   **Adapt to a changing world**: It is no longer brittle to API updates.
-*   **Solve novel problems**: It can learn to use tools or arguments it has never seen before.
-*   **Increase autonomy**: It requires less human intervention to fix simple but common execution failures related to syntax and versioning.
+```json
+// Example workflow scratchpad
+{
+  "task_id": "xyz-123",
+  "learned_this_session": {
+    "aws_s3_upload_with_tags_v2.15.0": {
+      "correct_command": "aws s3api put-object --tagging ...",
+      "researched_at": "2025-10-11T10:30:00Z"
+    }
+  }
+}
+```
+Before calling the Librarian, the Planner first checks this local cache for a solution.
 
-This enhancement transforms the "AI Virtual Developer Environment" from a powerful execution engine into a truly intelligent and adaptive system, capable of learning and problem-solving in a way that mirrors an expert human developer.
+#### 3.4. Graceful Fallbacks
+
+If the Librarian returns no useful results (or has a low confidence score), the system doesn't crash. The Planner uses the `fallback_suggestions` to attempt recovery:
+1.  **Retry Research**: Re-run `research_api_usage` with a broader query (e.g., `version='latest'` or a simplified query).
+2.  **Request Clarification**: If ambiguity exists, the system can pause and ask the user for more information.
+3.  **Escalate to Human**: As a final resort, the task is flagged for human review with a detailed context report, including the failed commands and the fruitless research attempts.
+
+### 4. Final Verdict
+
+This revised design, incorporating the reviewers' excellent feedback, is solid and directly solves the problem of API and SDK drift. The key innovations are now more robust:
+
+1.  ✅ **Dynamic, Version-Aware Learning**: The AI can research the *correct version* of documentation at runtime.
+2.  ✅ **Intelligent Self-Correction Loop**: The system uses specific error patterns to trigger research, avoiding guesswork.
+3.  ✅ **Efficient & Resilient**: Session-level caching prevents redundant work, and clear fallback strategies handle cases where documentation is unavailable.
+4.  ✅ **Future-Proof Data Model**: The metadata schema is designed to track data freshness and eventually learn from failure patterns.
+
+The "Fail → **Detect Version** → Research → Adapt" workflow is the critical innovation that transforms a brittle, static agent into a resilient, learning system that mirrors how expert human developers work when encountering unfamiliar or changed APIs.
