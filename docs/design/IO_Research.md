@@ -1,4 +1,4 @@
-### **Part 4: The Dynamic Knowledge & Adaptation Layer**
+### **Part 5: The Dynamic Knowledge & Adaptation Layer**
 
 This document incorporates reviewer feedback to enhance the design of the "Librarian" service and the self-correcting workflow. The core "Fail → Research → Adapt" loop is strengthened with proactive version detection, smarter triggers, and greater resilience.
 
