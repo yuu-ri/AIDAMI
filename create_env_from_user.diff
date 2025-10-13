@@ -1,0 +1,764 @@
+diff --git a/AiLab/chatEngine/message_functions.py b/AiLab/chatEngine/message_functions.py
+index 0fb7967..c670bb0 100644
+--- a/AiLab/chatEngine/message_functions.py
++++ b/AiLab/chatEngine/message_functions.py
+@@ -4,10 +4,13 @@ import requests # Add requests for sandbox communication
+ import os       # Add os to get environment variables
+ import datetime
+ import io
++import shlex # For parsing user input safely
+ from flask import jsonify, render_template, send_file
+ from mysql.connector import Error
+ from werkzeug.exceptions import Forbidden
+ from chatEngine.ACPL import ACPLInterpreter
++import logging
++logger = logging.getLogger(__name__)
+ 
+ def extract_acpl_script(input_string):
+     """Extracts the ACPL script from the first code block."""
+@@ -44,24 +47,21 @@ class MessageManager:
+         self.socketio = socketio
+         self.ai_handler = None 
+         self.interpreter = ACPLInterpreter()
+-        self.active_workflow_map = active_workflow_map # NEW: Store the shared map
++        self.active_workflow_map = active_workflow_map
++        self.active_environments = {} # NEW: Manages chat_id -> environment_id mapping
+     
+-    # SOLUTION: New private method to prepare history for the workflow payload.
+     def _prepare_workflow_history(self, chat_id: str) -> list:
+         """
+         Fetches and formats the last 10 messages from a chat to be used as context for the workflow.
+-        Mirrors the logic from ai_model_handler._prepare_history_context but is simpler.
+         """
+         try:
+             with self.db_manager.get_cursor(dictionary=True) as cursor:
+-                # Fetch the last 10 messages for the given conversation ID
+                 cursor.execute("""
+                     SELECT sender, content FROM messages
+                     WHERE conversation_id = %s
+                     ORDER BY timestamp DESC
+                     LIMIT 10
+                 """, (chat_id,))
+-                # Reverse the results to get chronological order
+                 chat_history = list(reversed(cursor.fetchall()))
+ 
+                 if not chat_history:
+@@ -290,18 +290,112 @@ class MessageManager:
+                 self.save_message_images(user_message_id, image_data_list)
+ 
+             response_content, response_type, response_id = "", "system", None
+-            
+-            if command_mode == 'git':
++
++            if command_mode == 'create_environment':
+                 sandbox_url = os.getenv('SANDBOX_API_URL')
+-                full_command = f"git {user_input}"
+-                payload = {"tool_name": "execute_git_command", "args": {"command": full_command}}
+-                try:
+-                    sandbox_response = requests.post(sandbox_url, json=payload, timeout=30)
+-                    sandbox_response.raise_for_status()
+-                    result = sandbox_response.json()
+-                    response_content = result.get("stdout", "No output from command.")
+-                except requests.exceptions.RequestException as e:
+-                    response_content = f"Error communicating with the execution sandbox: {e}"
++                
++                # Normalize chat_id for consistent usage
++                normalized_chat_id = str(chat_id)
++                logger.info(f"create_environment: normalized_chat_id={normalized_chat_id}")
++                
++                if normalized_chat_id in self.active_environments:
++                    existing_env = self.active_environments[normalized_chat_id]
++                    response_content = f"⚠️ Environment already exists for this chat: `{existing_env}`. Please destroy it first."
++                else:
++                    args = shlex.split(user_input)
++                    params = {"repo_url": None, "branch": None}
++                    if args: 
++                        params["repo_url"] = args[0]
++                    if len(args) > 1: 
++                        params["branch"] = args[1]
++                    
++                    payload = {"tool_name": "create_environment", "args": params}
++                    try:
++                        logger.info(f"Calling sandbox to create environment with payload: {payload}")
++                        res = requests.post(sandbox_url, json=payload, timeout=300)
++                        res.raise_for_status()
++                        result = res.json()
++                        
++                        if result.get("error"):
++                            response_content = f"❌ **Failed to Create Environment**\n\n```\n{result.get('stdout')}\n```"
++                        else:
++                            env_id = result.get("environment_id")
++                            self.active_environments[normalized_chat_id] = env_id
++                            logger.info(f"Created environment {env_id} for chat {normalized_chat_id}. Active envs: {self.active_environments}")
++                            response_content = f"✅ **Environment Created**\n\n- **ID:** `{env_id}`"
++                    except requests.RequestException as e:
++                        logger.error(f"Error creating environment: {e}")
++                        response_content = f"❌ Error connecting to sandbox: {e}"
++                        
++                message_data = self.save_chat_message(chat_id, "system", response_content, 'system', user_message_id, username=user['username'])
++                response_id = message_data["id"] 
++                self.notify_new_message(message_data)
++                
++            elif command_mode == 'destroy_environment':
++                sandbox_url = os.getenv('SANDBOX_API_URL')
++                
++                # Normalize chat_id for consistent usage
++                normalized_chat_id = str(chat_id)
++                logger.info(f"destroy_environment: normalized_chat_id={normalized_chat_id}, active_envs={self.active_environments}")
++                
++                env_id = self.active_environments.pop(normalized_chat_id, None)
++                if not env_id:
++                    response_content = "⚠️ No active environment found for this chat."
++                else:
++                    payload = {"tool_name": "destroy_environment", "args": {"environment_id": env_id}}
++                    try:
++                        logger.info(f"Destroying environment {env_id}")
++                        res = requests.post(sandbox_url, json=payload, timeout=60)
++                        res.raise_for_status()
++                        result = res.json()
++                        response_content = f"✅ **Environment Destroyed**\n\n- **ID:** `{env_id}`\n- **Status:** `{result.get('stdout')}`"
++                    except requests.RequestException as e:
++                        logger.error(f"Error destroying environment: {e}")
++                        response_content = f"❌ Error connecting to sandbox: {e}"
++                        
++                message_data = self.save_chat_message(chat_id, "system", response_content, 'system', user_message_id, username=user['username'])
++                response_id = message_data["id"] 
++                self.notify_new_message(message_data)
++
++            elif command_mode == 'exec_in_env':
++                sandbox_url = os.getenv('SANDBOX_API_URL')
++                
++                # Normalize chat_id for consistent usage
++                normalized_chat_id = str(chat_id)
++                env_id = self.active_environments.get(normalized_chat_id)
++                
++                logger.info(f"exec_in_env: normalized_chat_id={normalized_chat_id}, env_id={env_id}, active_envs={self.active_environments}")
++                
++                if not env_id:
++                    response_content = "❌ **No active environment.**\n\nPlease use `create_env` command first to start a sandbox."
++                else:
++                    timeout_seconds = 60
++                    payload = {
++                        "tool_name": "execute_command", 
++                        "args": {
++                            "environment_id": env_id, 
++                            "command": user_input, 
++                            "timeout_seconds": timeout_seconds
++                        }
++                    }
++                    
++                    logger.info(f"Sending execute_command with payload: {payload}")
++                    
++                    try:
++                        sandbox_response = requests.post(sandbox_url, json=payload, timeout=30)
++                        sandbox_response.raise_for_status()
++                        result = sandbox_response.json()
++                        
++                        if result.get("error"):
++                            stderr_content = result.get('stderr', '')
++                            stdout_content = result.get('stdout', '')
++                            combined = (stdout_content + '\n' + stderr_content).strip()
++                            response_content = f"❌ **Command Failed (exit code: {result.get('exit_code', 'unknown')})**\n\n```\n{combined if combined else 'Unknown error'}\n```"
++                        else:
++                            response_content = result.get("stdout", "No output from command.")
++                    except requests.exceptions.RequestException as e:
++                        logger.error(f"Error executing command in environment: {e}")
++                        response_content = f"Error communicating with the execution sandbox: {e}"
+                 
+                 message_data = self.save_chat_message(chat_id, "system", response_content, 'system', user_message_id, username=user['username'])
+                 response_id = message_data["id"] 
+@@ -540,7 +634,7 @@ class MessageManager:
+                         try:
+                             image_bytes = base64.b64decode(base64_data)
+                             existing_images.append({'data': image_bytes, 'type': mime_type})
+-                            return '{{IMAGE}}'
++                            return ''
+                         except Exception as e:
+                             print(f"Warning: Could not decode base64 image: {e}")
+                             return match.group(0)
+@@ -568,7 +662,7 @@ class MessageManager:
+                         base64_encoded_data = base64.b64encode(img['data']).decode('utf-8')
+                         data_uri = f"data:{img['type']};base64,{base64_encoded_data}"
+                         markdown_image_tag = f"\n![Generated Image]({data_uri})\n"
+-                        unified_response_content = unified_response_content.replace('{{IMAGE}}', markdown_image_tag, 1)
++                        unified_response_content = unified_response_content.replace('', markdown_image_tag, 1)
+                 # --- END: Re-embedding logic ---
+ 
+                 # Save the final, unified message. The 'images' list passed here is for WebSocket display
+@@ -676,4 +770,6 @@ class MessageManager:
+         except Error as e:
+             return f"Error loading attachment: {e}", 500
+ 
++
++
+ 
+\ No newline at end of file
+diff --git a/AiLab/static/chatEngine/chatEngine.html b/AiLab/static/chatEngine/chatEngine.html
+index 043b37b..ed5e62e 100644
+--- a/AiLab/static/chatEngine/chatEngine.html
++++ b/AiLab/static/chatEngine/chatEngine.html
+@@ -55,6 +55,9 @@
+                         <select id="command-mode-select">
+                             <option value="AI" selected>AI</option>
+                             <option value="cmd">cmd</option>
++                            <option value="create_environment">create_env</option>
++                            <option value="destroy_environment">destroy_env</option>
++                            <option value="exec_in_env">exec_in_env</option>
+                             <option value="open">open</option>
+                             <option value="save">save</option>
+                             <option value="open_md">open_md</option>
+@@ -152,4 +155,5 @@
+         });
+     </script>
+ </body>
+-</html>
++</html>
++
+\ No newline at end of file
+diff --git a/AiLab/static/chatEngine/message.js b/AiLab/static/chatEngine/message.js
+index eefc487..71fdd9d 100644
+--- a/AiLab/static/chatEngine/message.js
++++ b/AiLab/static/chatEngine/message.js
+@@ -408,13 +408,14 @@ function addMessage(messageData, shouldScroll = true) {
+ async function handleSendMessage(e, gUsername, currentChatId) {
+     e.preventDefault();
+     const userInput = chatInputEditor.getValue().trim(); // Get value from CodeMirror
+-
++    const commandMode = document.getElementById('command-mode-select').value;
++  
+     // Note: uploadedImageFiles should be empty now if images were embedded, but this check remains safe.
+-    if (!userInput && uploadedImageFiles.length === 0 && uploadedGenericFiles.length === 0) return;
++    if (!userInput && uploadedImageFiles.length === 0 && uploadedGenericFiles.length === 0 && commandMode!="create_environment" && commandMode!="destroy_environment" && commandMode!="exec_in_env") return;
+ 
+     try {
+         const formData = new FormData();
+-        const commandMode = document.getElementById('command-mode-select').value;
++
+         
+         // --- NEW --- Set the flag for scrolling behavior based on current mode
+         wasLastCommandCmd = (commandMode === 'cmd');
+@@ -936,4 +937,5 @@ export {
+     uploadedImageFiles, 
+     renderImagePreviews,
+     chatInputEditor
+-};
+\ No newline at end of file
++};
++
+\ No newline at end of file
+diff --git a/docker-compose_develop.yml b/docker-compose_develop.yml
+index 50c992d..42e199e 100644
+--- a/docker-compose_develop.yml
++++ b/docker-compose_develop.yml
+@@ -64,7 +64,7 @@ services:
+       - app-network
+     volumes:
+       - ./sandbox_service/app:/app
+-      - /home/yong/swWebOffice:/work
++      - /home/yong/swWebOffice:/work  # This is the host path mounted into sandbox_service at /work
+       - /home/yong/secret:/secret
+       - /var/run/docker.sock:/var/run/docker.sock
+     working_dir: /work
+@@ -84,7 +84,8 @@ services:
+       SANDBOX_MIN_POOL_SIZE: 2
+       SANDBOX_MAX_POOL_SIZE: 5
+       SANDBOX_POOL_REFILL_INTERVAL: 30 
+-      DEFAULT_AI_REPO_URL: "https://github.com/yuu-ri/swWebOffice.git" 
++      DEFAULT_AI_REPO_URL: "https://github.com/yuu-ri/swWebOffice.git"
++      SANDBOX_ALLOWED_MOUNT_BASE: /work # <--- ADD THIS LINE
+     ports:
+       - "5001:5000"
+ 
+@@ -220,4 +221,4 @@ networks:
+ volumes:
+   mysql-data-develop:
+   temporal-postgres-data:
+-  qdrant-data-develop: # <-- NEW VOLUME
+\ No newline at end of file
++  qdrant-data-develop:
+\ No newline at end of file
+diff --git a/sandbox_service/app/main.py b/sandbox_service/app/main.py
+index fe5e753..fb111c0 100644
+--- a/sandbox_service/app/main.py
++++ b/sandbox_service/app/main.py
+@@ -214,4 +214,5 @@ def reload_tools_endpoint():
+ 
+ if __name__ == "__main__":
+     logger.info("Starting Flask sandbox server...")
+-    app.run(host="0.0.0.0", port=5001)
+\ No newline at end of file
++    app.run(host="0.0.0.0", port=5001)
++
+\ No newline at end of file
+diff --git a/sandbox_service/app/tools/environment_manager.py b/sandbox_service/app/tools/environment_manager.py
+index b1ecea6..8ea46b1 100644
+--- a/sandbox_service/app/tools/environment_manager.py
++++ b/sandbox_service/app/tools/environment_manager.py
+@@ -29,6 +29,15 @@ BASE_IMAGE_FOR_TASKS = os.getenv("BASE_IMAGE_FOR_TASKS", "ai-dev-base")
+ MANAGED_LABEL = "ai_sandbox_managed"
+ CONTAINER_WORKSPACE_PATH = "/workspace"
+ 
++# --- NEW: Security configuration for host mounting ---
++ALLOWED_MOUNT_BASE = os.getenv("SANDBOX_ALLOWED_MOUNT_BASE")
++if ALLOWED_MOUNT_BASE:
++    ALLOWED_MOUNT_BASE = os.path.abspath(ALLOWED_MOUNT_BASE)
++    logger.warning(f"Host mounting is ENABLED. Base path restricted to: {ALLOWED_MOUNT_BASE}")
++else:
++    logger.info("Host mounting is DISABLED. Set SANDBOX_ALLOWED_MOUNT_BASE to enable it.")
++
++
+ # Pooling configuration
+ MIN_POOL_SIZE = int(os.getenv("SANDBOX_MIN_POOL_SIZE", "2"))
+ MAX_POOL_SIZE = int(os.getenv("SANDBOX_MAX_POOL_SIZE", "5"))
+@@ -40,7 +49,7 @@ DEFAULT_AI_REPO_BRANCH = os.getenv("DEFAULT_AI_REPO_BRANCH", "develop")
+ 
+ # Global container pool
+ _container_pool = deque()
+-_in_use_containers = {}
++_in_use_containers = {} # Stores (container_obj, volume_name_or_None)
+ _pool_lock = threading.Lock()
+ 
+ class EnvironmentManager:
+@@ -49,43 +58,89 @@ class EnvironmentManager:
+             self._init_pool()
+             threading.Thread(target=self._pool_refiller, daemon=True).start()
+ 
+-    def _create_new_raw_container(self):
+-        """Creates a new container with an empty workspace volume."""
++    def _validate_mount_path(self, mount_path: str) -> (str, str):
++        """
++        Validates the mount path against the allowed base directory.
++        Returns (absolute_validated_path, error_message)
++        """
++        if not ALLOWED_MOUNT_BASE:
++            return None, "Host mounting is disabled on the server (SANDBOX_ALLOWED_MOUNT_BASE not set)."
++        
++        if not mount_path:
++            return None, "Mount path cannot be empty."
++
++        try:
++            # Resolve the absolute path to prevent traversal attacks (e.g., ../../)
++            # and ensure it's relative to the ALLOWED_MOUNT_BASE if specified.
++            absolute_path = os.path.abspath(os.path.join(ALLOWED_MOUNT_BASE, mount_path))
++        except Exception as e:
++             return None, f"Invalid mount path specified: {e}"
++
++        # Ensure the resolved path is within the allowed base directory
++        if not absolute_path.startswith(ALLOWED_MOUNT_BASE):
++            return None, f"Path traversal detected. Mount path '{mount_path}' must be within the allowed base directory: {ALLOWED_MOUNT_BASE}"
++        
++        # Ensure the directory exists on the host
++        if not os.path.isdir(absolute_path):
++            return None, f"The specified host path does not exist or is not a directory: {absolute_path}"
++
++        return absolute_path, None
++
++    def _create_new_raw_container(self, mount_path: str = None):
++        """
++        Creates a new container, optionally with a bind mount instead of a volume.
++        Returns (container_obj, volume_name_if_any)
++        """
+         if not docker_client:
+             raise Exception("Docker client not available.")
+ 
+-        volume_name = f"sandbox_vol_{uuid.uuid4()}"
+-        volume = docker_client.volumes.create(name=volume_name)
++        mounts = []
++        volume_name = None
++        
++        if mount_path:
++            # Create a bind mount from the host
++            mounts.append(docker.types.Mount(
++                target=CONTAINER_WORKSPACE_PATH,
++                source=mount_path,
++                type='bind'
++            ))
++            logger.info(f"Creating container with host mount: {mount_path}")
++        else:
++            # Create an isolated volume
++            volume_name = f"sandbox_vol_{uuid.uuid4()}"
++            volume = docker_client.volumes.create(name=volume_name)
++            mounts.append(docker.types.Mount(
++                target=CONTAINER_WORKSPACE_PATH,
++                source=volume.name,
++                type='volume'
++            ))
++            logger.info(f"Creating container with isolated volume: {volume_name}")
+ 
+-        mount = docker.types.Mount(
+-            target=CONTAINER_WORKSPACE_PATH,
+-            source=volume.name,
+-            type='volume'
+-        )
+ 
+         container = docker_client.containers.run(
+             BASE_IMAGE_FOR_TASKS,
+             detach=True,
+             tty=True,
+             working_dir=CONTAINER_WORKSPACE_PATH,
+-            mounts=[mount],
++            mounts=mounts,
+             labels={MANAGED_LABEL: "true"},
+             network='bridge',
+             mem_limit='512m',
+             cpu_period=100000,
+             cpu_quota=50000
+         )
+-        logger.info(f"Created new raw container: {container.short_id} with volume {volume.name}")
+-        return container, volume.name
++        logger.info(f"Created new raw container: {container.short_id}")
++        return container, volume_name # volume_name will be None for bind mounts
+ 
+     def _init_pool(self):
+         """Initializes the container pool with MIN_POOL_SIZE containers."""
+         if not docker_client: return
+         logger.info(f"Initializing container pool with {MIN_POOL_SIZE} containers...")
+         with _pool_lock:
++            # Pooled containers should not have mounts.
+             for _ in range(MIN_POOL_SIZE):
+                 try:
+-                    container, volume_name = self._create_new_raw_container()
++                    container, volume_name = self._create_new_raw_container(mount_path=None) 
+                     _container_pool.append((container, volume_name))
+                 except Exception as e:
+                     logger.error(f"Failed to pre-create container for pool: {e}")
+@@ -101,14 +156,15 @@ class EnvironmentManager:
+                     logger.info(f"Refilling container pool. Adding {num_to_add} containers...")
+                     for _ in range(num_to_add):
+                         try:
+-                            container, volume_name = self._create_new_raw_container()
++                            container, volume_name = self._create_new_raw_container(mount_path=None)
+                             _container_pool.append((container, volume_name))
+                         except Exception as e:
+                             logger.error(f"Failed to refill container for pool: {e}")
+                 
+                 while len(_container_pool) > MAX_POOL_SIZE:
+                     container, volume_name = _container_pool.popleft()
+-                    self._destroy_raw_container(container, volume_name, force_remove_volume=True)
++                    # Only remove volume if it's not a bind mount
++                    self._destroy_raw_container(container, volume_name, force_remove_volume=True) 
+                     logger.info(f"Destroyed excess container from pool: {container.short_id}")
+ 
+     def _run_command_in_container(self, container_obj, command, timeout=60):
+@@ -134,24 +190,33 @@ class EnvironmentManager:
+     def _clean_container_workspace(self, container_obj):
+         """Wipes the /workspace directory of a container, making it ready for a fresh clone."""
+         logger.debug(f"Wiping workspace for container {container_obj.short_id}")
++        # Only wipe if it's not a bind mount, to prevent host data loss
++        for mnt in container_obj.attrs['Mounts']:
++            if mnt['Destination'] == CONTAINER_WORKSPACE_PATH and mnt['Type'] == 'bind':
++                logger.warning(f"Skipping workspace wipe for bind-mounted container {container_obj.short_id} to prevent host data loss.")
++                return
++
+         self._run_command_in_container(container_obj, "find /workspace -mindepth 1 -delete", timeout=30)
+         logger.debug(f"Workspace for {container_obj.short_id} wiped clean.")
+ 
+     def _destroy_raw_container(self, container_obj, volume_name, force_remove_volume=False):
+         """
+-        Stops and removes a container and its associated volume.
++        Stops and removes a container and its associated volume (if it has one and is not a bind mount).
+         """
+         try:
+             container_obj.stop(timeout=5)
+-            container_obj.remove(v=force_remove_volume) 
+-            if force_remove_volume:
++            # v=False explicitly, we manage volume removal separately for named volumes.
++            container_obj.remove(v=False) 
++            
++            # Only try to remove a volume if a name was provided (i.e., it was not a bind mount)
++            if volume_name and force_remove_volume:
+                 try:
+                     docker_client.volumes.get(volume_name).remove()
+                     logger.info(f"Destroyed container {container_obj.short_id} and its volume {volume_name}")
+                 except docker.errors.NotFound:
+                     logger.warning(f"Volume '{volume_name}' not found during explicit removal.")
+             else:
+-                logger.info(f"Destroyed container {container_obj.short_id} (volume {volume_name} left for reuse).")
++                logger.info(f"Destroyed container {container_obj.short_id} (volume_name: {volume_name if volume_name else 'N/A, likely bind-mounted'}).")
+         except docker.errors.NotFound:
+             logger.warning(f"Container '{container_obj.short_id}' not found during destruction.")
+         except Exception as e:
+@@ -159,11 +224,28 @@ class EnvironmentManager:
+ 
+ 
+     # --- Public methods for tools to call ---
+-    def create_environment_for_ai(self, repo_url: str = None, branch: str = None) -> dict:
+-        """Centralized logic for creating/provisioning an environment, handling pooling and smart git updates."""
++    def create_environment_for_ai(self, repo_url: str = None, branch: str = None, mount_path: str = None) -> dict:
++        """Centralized logic for creating/provisioning an environment."""
+         if not docker_client:
+             return {"error": True, "stdout": "Docker client is not available."}
+-
++        logger.info("--1--")
++        # --- Host Mount Logic ---
++        if mount_path:
++            validated_path, error_msg = self._validate_mount_path(mount_path)
++            if error_msg:
++                return {"error": True, "stdout": error_msg}
++            try:
++                # Create a container with a bind mount, which is NOT pooled.
++                container, _ = self._create_new_raw_container(mount_path=validated_path)
++                with _pool_lock:
++                    # Store (container_obj, None) as there's no Docker volume name
++                    _in_use_containers[container.id] = (container, None) 
++                return {"error": False, "environment_id": container.id, "volume_id": None}
++            except Exception as e:
++                logger.error(f"Failed to create container with mount path {validated_path}: {e}", exc_info=True)
++                return {"error": True, "stdout": f"Failed to create mounted environment: {e}"}
++        logger.info("--2--")
++        # --- Pooled/Volume Logic ---
+         container, volume_name = None, None
+         with _pool_lock:
+             if _container_pool:
+@@ -176,8 +258,7 @@ class EnvironmentManager:
+                 except Exception as e:
+                     logger.error(f"Failed to create new container when pool was empty: {e}", exc_info=True)
+                     return {"error": True, "stdout": f"Failed to create environment: {e}"}
+-
+-        # Determine target repository and branch
++        logger.info("--3--")
+         final_repo_url = repo_url if repo_url else DEFAULT_AI_REPO_URL
+         final_branch = branch if branch else DEFAULT_AI_REPO_BRANCH
+ 
+@@ -188,7 +269,7 @@ class EnvironmentManager:
+             with _pool_lock:
+                 _in_use_containers[container.id] = (container, volume_name)
+             return {"error": False, "environment_id": container.id, "volume_id": volume_name}
+-
++        logger.info("--4--")
+         # Prepare authenticated URL for git commands if PAT is available
+         pat = os.getenv("GIT_PAT")
+         authenticated_repo_url = final_repo_url
+@@ -197,14 +278,14 @@ class EnvironmentManager:
+             authenticated_repo_url = authenticated_repo_url.replace(
+                 "https://", f"https://x-access-token:{pat}@"
+             )
+-
++        logger.info("--5--")
+         # Check if the correct repo is already in the workspace
+         check_repo_cmd = "git config --get remote.origin.url"
+         check_result = self._run_command_in_container(container, check_repo_cmd, timeout=10)
+         current_repo_url = check_result['stdout'].strip().replace(f"x-access-token:{pat}@", "") if pat else check_result['stdout'].strip()
+         is_correct_repo = (check_result['exit_code'] == 0 and current_repo_url == final_repo_url)
+-        
+         repo_setup_successful = False
++        logger.info("--6--")
+         if is_correct_repo:
+             # --- ATTEMPT TO UPDATE EXISTING REPO ---
+             logger.info(f"Correct repo found in {container.short_id}. Fetching latest from branch '{final_branch}'.")
+@@ -214,7 +295,7 @@ class EnvironmentManager:
+                 "git clean -fdx",  # Clean untracked files/dirs, including ignored files
+                 "git submodule update --init --recursive"
+             ]
+-            for i, cmd in enumerate(update_commands):
++            for cmd in update_commands: # Looping without index is cleaner
+                 result = self._run_command_in_container(container, cmd, timeout=180)
+                 if result['exit_code'] != 0:
+                     sanitized_stderr = result['stderr'].replace(pat, '***') if pat else result['stderr']
+@@ -223,10 +304,10 @@ class EnvironmentManager:
+                     self._clean_container_workspace(container)
+                     is_correct_repo = False  # Mark for re-clone
+                     break
+-                if i == len(update_commands) - 1: # If last command succeeded
+-                    repo_setup_successful = True
+-                    logger.info(f"Repo in {container.short_id} successfully updated to latest from '{final_branch}'.")
+-
++            else: # This 'else' block executes if the loop completed without a 'break'
++                repo_setup_successful = True
++                logger.info(f"Repo in {container.short_id} successfully updated to latest from '{final_branch}'.")
++        logger.info("--7--")
+         if not is_correct_repo:
+             # --- CLONE NEW REPO (or re-clone on failure) ---
+             logger.info(f"Cloning repo '{final_repo_url}' (branch: {final_branch}) into {container.short_id}.")
+@@ -244,7 +325,7 @@ class EnvironmentManager:
+                 logger.error(f"Failed to clone repo {final_repo_url} into {container.short_id}: {sanitized_stderr}")
+                 self._destroy_raw_container(container, volume_name, force_remove_volume=True)
+                 return {"error": True, "stdout": f"Failed to clone repository: {sanitized_stderr}"}
+-
++        logger.info("--8--")
+         if repo_setup_successful:
+             with _pool_lock:
+                 _in_use_containers[container.id] = (container, volume_name)
+@@ -257,37 +338,52 @@ class EnvironmentManager:
+     def destroy_environment_for_ai(self, environment_id: str) -> dict:
+         """Centralized logic for destroying/returning an environment to the pool."""
+         if not docker_client: return {"error": True, "stdout": "Docker client is not available."}
++        logger.info("--1--")
+         container_data = None
+         with _pool_lock:
+             container_data = _in_use_containers.pop(environment_id, None)
+         
+         if not container_data:
+-            logger.warning(f"Attempted to destroy environment {environment_id} but it was not found.")
++            logger.warning(f"Attempted to destroy environment {environment_id} but it was not found in active list.")
+             return {"error": False, "stdout": f"Environment {environment_id} not found or already destroyed."}
++        logger.info("--2--")       
++        container, volume_name = container_data # volume_name will be None for bind mounts
+         
+-        container, actual_volume_name = container_data
++        # If it was a bind-mounted container (volume_name is None), always destroy it completely.
++        if volume_name is None:
++            self._destroy_raw_container(container, None, force_remove_volume=False) # No Docker volume to remove
++            logger.info(f"Destroyed bind-mounted environment {environment_id}.")
++            return {"error": False, "stdout": f"Environment {environment_id} destroyed."}
++        logger.info("--3--")
++        # Otherwise, if it has a Docker volume, try to return it to the pool.
+         try:
+-            # Note: Workspace cleaning is now done before assigning a repo, not on destruction.
+             with _pool_lock:
+                 if len(_container_pool) < MAX_POOL_SIZE:
++                    self._clean_container_workspace(container) # Clean before returning to pool
+                     _container_pool.append(container_data)
+                     logger.info(f"Returned container {container.short_id} to pool. Size: {len(_container_pool)}")
+                     return {"error": False, "stdout": f"Environment {environment_id} returned to pool."}
+                 else:
+-                    self._destroy_raw_container(container, actual_volume_name, force_remove_volume=True)
++                    self._destroy_raw_container(container, volume_name, force_remove_volume=True)
+                     logger.info(f"Destroyed excess environment {environment_id} (pool full).")
+                     return {"error": False, "stdout": f"Environment {environment_id} destroyed."}
+         except Exception as e:
+             logger.error(f"Failed to destroy/return environment {environment_id}: {e}", exc_info=True)
+-            self._destroy_raw_container(container, actual_volume_name, force_remove_volume=True)
++            # As a fallback, ensure the container is removed even if pooling fails
++            self._destroy_raw_container(container, volume_name, force_remove_volume=True)
+             return {"error": True, "stdout": f"An error occurred during environment cleanup: {e}"}
+ 
+     def execute_command_in_env(self, environment_id: str, command: str, timeout_seconds: int) -> dict:
+         """Centralized logic for executing commands."""
+         if not docker_client: return {"error": True, "stdout": "", "stderr": "Docker client is not available.", "exit_code": -1}
+-        container_data = _in_use_containers.get(environment_id)
++        
++        # Access _in_use_containers in a thread-safe manner
++        container_data = None
++        with _pool_lock:
++            container_data = _in_use_containers.get(environment_id)
++
+         if not container_data:
+-            return {"error": True, "stdout": "", "stderr": f"Environment '{environment_id}' not found.", "exit_code": -1}
++            return {"error": True, "stdout": "", "stderr": f"Environment '{environment_id}' not found. It might have been destroyed or never created.", "exit_code": -1}
+         
+         container = container_data[0]
+         try:
+@@ -296,7 +392,7 @@ class EnvironmentManager:
+             is_error = result['exit_code'] != 0
+             return {"error": is_error, **result}
+         except docker.errors.NotFound:
+-            return {"error": True, "stdout": "", "stderr": f"Container {environment_id} not found.", "exit_code": -1}
++            return {"error": True, "stdout": "", "stderr": f"Container {environment_id} not found (unexpectedly).", "exit_code": -1}
+         except Exception as e:
+             logger.error(f"Error executing command in {environment_id}: {e}", exc_info=True)
+             return {"error": True, "stdout": "", "stderr": f"An unexpected error occurred: {e}", "exit_code": -1}
+@@ -307,21 +403,24 @@ env_manager = EnvironmentManager()
+ # --- Tool Implementations (delegating to env_manager) ---
+ 
+ class CreateEnvironmentSchema(BaseModel):
+-    repo_url: str = Field(None, description="Optional: A Git repository URL to clone. If not provided, a default repo might be used or the workspace starts empty.")
+-    branch: str = Field(None, description="Optional: The specific branch to clone or check out. Defaults to 'develop'.")
++    repo_url: str = Field(None, description="Optional: A Git repository URL to clone. Ignored if `mount_path` is provided.")
++    branch: str = Field(None, description="Optional: The specific branch to clone. Defaults to 'develop'. Ignored if `mount_path` is provided.")
++    mount_path: str = Field(None, description="Optional: A relative path on the host machine to mount into the workspace. This path must be within the server's pre-configured base directory (SANDBOX_ALLOWED_MOUNT_BASE).")
+ 
+ class CreateEnvironmentTool(BaseTool):
+     name = "create_environment"
+-    description = "Provisions a new, isolated, stateful development environment for the current task. This MUST be the first step in any plan that requires file system access or command execution. Optionally, initialize the workspace by cloning a Git repository and checking out a specific branch."
+-    limitations = "Each environment is ephemeral and will be destroyed after the task. Internet access is available for operations like 'git clone'. Resource limits apply."
++    description = ("Provisions a new, isolated development environment. "
++                   "Either clones a Git repo into an isolated volume or mounts a directory from the host machine. "
++                   "Mounting a host directory takes precedence over cloning a repository.")
++    limitations = "Each environment is ephemeral. Resource limits apply. Host path mounting is a privileged operation and is restricted for security. Git PAT must be configured for private repos."
+     output_description = """Returns a JSON object with:
+-- 'environment_id': A unique ID for the created environment. This ID must be passed to all subsequent environment tools.
+-- 'volume_id': A unique ID for the storage volume. This is for internal tracking.
++- 'environment_id': A unique ID for the created environment.
++- 'volume_id': A unique ID for the storage volume, or null if a host path was mounted.
+ - 'error': A boolean, true if creation failed."""
+     schema = CreateEnvironmentSchema
+ 
+-    def run(self, repo_url: str = None, branch: str = None) -> dict:
+-        return env_manager.create_environment_for_ai(repo_url, branch)
++    def run(self, repo_url: str = None, branch: str = None, mount_path: str = None) -> dict:
++        return env_manager.create_environment_for_ai(repo_url, branch, mount_path)
+ 
+ 
+ class ExecuteCommandSchema(BaseModel):
+@@ -363,11 +462,9 @@ class WriteFileTool(BaseTool):
+             return {"error": True, "stdout": "Docker client is not available."}
+         
+         b64_content = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+-        # Use shlex.quote to safely handle paths with spaces or special characters
+         safe_path = shlex.quote(path)
+         safe_dirname = shlex.quote(os.path.dirname(path))
+         
+-        # Check if dirname is empty or '.', which would cause 'mkdir -p' to fail.
+         if safe_dirname in ["''", "'.'"]:
+              command = f"echo {shlex.quote(b64_content)} | base64 -d > {safe_path}"
+         else:
+@@ -412,12 +509,13 @@ class DestroyEnvironmentSchema(BaseModel):
+ 
+ class DestroyEnvironmentTool(BaseTool):
+     name = "destroy_environment"
+-    description = "Decommissions and cleans up an environment. This MUST be the final step in any plan to prevent resource leaks. The environment might be returned to a pool instead of being truly destroyed."
+-    limitations = "This action is irreversible for the AI's current state. All data within the environment for the current task will be lost."
++    description = "Decommissions and cleans up an environment. The environment might be returned to a pool or fully destroyed. This is managed by the user."
++    limitations = "This action is irreversible for the current task. All data within the environment will be lost."
+     output_description = """Returns a JSON object with:
+ - 'stdout': A confirmation message.
+ - 'error': A boolean, true if cleanup failed."""
+     schema = DestroyEnvironmentSchema
+ 
+     def run(self, environment_id: str) -> dict:
+-        return env_manager.destroy_environment_for_ai(environment_id)
+\ No newline at end of file
++        return env_manager.destroy_environment_for_ai(environment_id)
++
+\ No newline at end of file
+diff --git a/workflow_service/app/activities/planner.py b/workflow_service/app/activities/planner.py
+index cae26e7..a512b80 100644
+--- a/workflow_service/app/activities/planner.py
++++ b/workflow_service/app/activities/planner.py
+@@ -162,20 +162,16 @@ The user's LATEST request is: "{task}".
+ 
+ **How to Chain Tools (JSONPath):**
+ To use an output from a previous step, use the format `{{{{step_id.output.path.to.value}}}}`.
+-**Example Lifecycle Plan:**
++
++**Example Plan:**
+ \n```json
+ {{
+   "steps": [
+-    {{
+-      "step_id": "create_dev_env",
+-      "action": "create_environment",
+-      "inputs": {{}}
+-    }},
+     {{
+       "step_id": "list_files",
+       "action": "execute_command",
+       "inputs": {{
+-        "environment_id": "{{{{create_dev_env.output.environment_id}}}}",
++        "environment_id": "{environment_id}",
+         "command": "ls -l"
+       }}
+     }},
+@@ -185,20 +181,13 @@ To use an output from a previous step, use the format `{{{{step_id.output.path.t
+       "inputs": {{
+         "prompt": "Based on the file listing, summarize the project structure. File list: {{{{list_files.output.stdout}}}}"
+       }}
+-    }},
+-    {{
+-      "step_id": "cleanup_env",
+-      "action": "destroy_environment",
+-      "inputs": {{
+-        "environment_id": "{{{{create_dev_env.output.environment_id}}}}"
+-      }}
+     }}
+   ]
+ }}
+ \n```
+ ---
+ 
+-**Your response MUST be a valid JSON object conforming to the following schema:**
++Your response MUST be a valid JSON object conforming to the following schema:
+ \n```json
+ {plan_schema}
+ \n```
