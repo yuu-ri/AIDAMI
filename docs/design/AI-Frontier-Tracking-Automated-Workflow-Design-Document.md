@@ -1,4 +1,4 @@
-
+```
 ## **设计文档：AI驱动的“AI前沿追踪”自动化工作流系统**
 
 ### 1. 概述与愿景
@@ -63,36 +63,98 @@
 {
   "steps": [
     {
-      "type": "action", "step_id": "collect_arxiv", "action": "fetch_arxiv_daily", "inputs": {}
-    },
-    {
-      "type": "action", "step_id": "collect_github", "action": "fetch_github_trending_ai", "inputs": {}
-    },
-    {
-      "type": "action", "step_id": "collect_hf", "action": "fetch_huggingface_trending", "inputs": {}
-    },
-    {
-      "type": "action", "step_id": "collect_hn", "action": "fetch_hackernews_ai", "inputs": {}
-    },
-    {
       "type": "action",
-      "step_id": "aggregate_daily_data",
-      "action": "generate_structured_data",
+      "action": "execute_command",
       "inputs": {
-        "prompt": "You are a data aggregation AI. Combine the following data sources into a single, clean JSON object. Add a 'source' field to each item. Do not summarize or alter the content. \n\nArxiv:\n{{json.dumps(collect_arxiv.output.response)}}\n\nGitHub:\n{{json.dumps(collect_github.output.response)}}\n\nHuggingFace:\n{{json.dumps(collect_hf.output.response)}}\n\nHackerNews:\n{{json.dumps(collect_hn.output.response)}}\n\nRespond with ONLY a valid JSON object of the format `{\"arxiv\": [...], \"github\": [...], \"huggingface\": [...], \"hackernews\": [...]}`."
-      }
+        "command": "chmod +x sandbox_service/app/tools/*.sh",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "make_tools_executable",
+      "return_as_final_answer": false
     },
     {
       "type": "action",
-      "step_id": "save_daily_raw_data",
+      "action": "execute_command",
+      "inputs": {
+        "command": "sandbox_service/app/tools/arxiv_daily.sh",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "collect_arxiv_papers",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "execute_command",
+      "inputs": {
+        "command": "sandbox_service/app/tools/fetch_github_trending_ai.sh",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "collect_github_trending",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "execute_command",
+      "inputs": {
+        "command": "sandbox_service/app/tools/fetch_huggingface_trending.sh",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "collect_huggingface_models",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "execute_command",
+      "inputs": {
+        "command": "sandbox_service/app/tools/fetch_hackernews_ai.sh",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "collect_hackernews_stories",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "execute_command",
+      "inputs": {
+        "command": "date +%Y-%m-%d | tr -d '\\n'",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "get_current_date_for_filename",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "execute_command",
+      "inputs": {
+        "command": "cat <<'EOF' | python3 -m json.tool\n{\n  \"arxiv\": {{collect_arxiv_papers.output.stdout}},\n  \"github\": {{collect_github_trending.output.stdout}},\n  \"huggingface\": {{collect_huggingface_models.output.stdout}},\n  \"hackernews\": {{collect_hackernews_stories.output.stdout}}\n}\nEOF",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "format_json_content",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
       "action": "write_files",
       "inputs": {
-        "environment_id": "{{environment_id}}",
-        "files": [{
-          "filepath": "/data/raw/{{current_date('YYYY-MM-DD')}}.json",
-          "content": "{{aggregate_daily_data.output.response}}"
-        }]
+        "files": [
+          {
+            "content": "{{format_json_content.output.stdout}}",
+            "filepath": "data/daily/{{get_current_date_for_filename.output.stdout}}.json"
+          }
+        ],
+        "environment_id": "{{environment_id}}"
       },
+      "step_id": "save_aggregated_data_to_file",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "execute_command",
+      "inputs": {
+        "command": "sudo cp -r data /host/",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "copy_to_host",
       "return_as_final_answer": true
     }
   ]
@@ -111,48 +173,102 @@
   "steps": [
     {
       "type": "action",
-      "step_id": "read_weekly_data",
       "action": "execute_command",
       "inputs": {
-        "environment_id": "{{environment_id}}",
-        "command": "find /data/raw -name '*.json' -mtime -7 | xargs cat | jq -s 'add'"
-      }
+        "command": "find /host/data/daily -name '*.json' -mtime -7 -type f | sort",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "list_weekly_files",
+      "return_as_final_answer": false
     },
     {
       "type": "action",
-      "step_id": "analyze_trends_and_rank",
+      "action": "execute_command",
+      "inputs": {
+        "command": "jq -s '{\n  arxiv:      (map(.arxiv      // []) | add // []),\n  github:     (map(.github     // []) | add // []),\n  huggingface:(map(.huggingface// []) | add // []),\n  hackernews: (map(.hackernews // []) | add // [])\n}' /host/data/daily/*.json",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "aggregate_weekly_data",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
       "action": "generate_text_response",
       "inputs": {
-        "prompt": "You are a top-tier AI research analyst. Analyze the past week's AI data below. Identify:\n1. The 3 most significant overarching trends (e.g., 'Emergence of Small Language Models for Edge AI').\n2. The 5 most important individual items (papers, repos, models) and assign a 'Significance Score' from 1-10.\n3. A brief, sharp analysis for each trend and top item.\n\nData:\n{{read_weekly_data.output.stdout}}\n\nOutput in clear, structured Markdown."
-      }
+        "prompt": "You are a top-tier AI research analyst with deep expertise in machine learning, NLP, computer vision, and emerging AI technologies.\n\nAnalyze the following week's AI data and provide:\n\n1. **Top 3 Overarching Trends**: Identify the most significant macro-trends (e.g., 'Emergence of Small Language Models for Edge AI', 'Multimodal AI Breakthroughs', 'Open Source vs Closed Models Debate'). For each trend, explain WHY it matters and what it signals about the future.\n\n2. **Top 5 Most Important Items**: Rank the 5 most significant individual items (papers, repositories, models, or news) with a Significance Score (1-10). Consider factors like:\n   - Technical innovation and novelty\n   - Potential real-world impact\n   - Community interest and adoption\n   - Paradigm-shifting implications\n\n3. **Sharp Analysis**: For each trend and top item, provide concise but insightful commentary. Avoid generic statements.\n\n**Weekly Data:**\n```json\n{{aggregate_weekly_data.output.stdout}}\n```\n\nOutput your analysis in clear, well-structured Markdown format with proper headings and bullet points."
+      },
+      "step_id": "analyze_trends_and_rank",
+      "return_as_final_answer": false
     },
     {
       "type": "action",
-      "step_id": "generate_learning_plan",
       "action": "generate_structured_data",
       "inputs": {
-        "prompt": "Based on the following trend analysis, create a practical, actionable learning plan for an AI developer for the upcoming week. For each trend, suggest one concrete action item (e.g., 'Read paper X', 'Run Colab notebook for repo Y').\n\nTrend Analysis:\n{{analyze_trends_and_rank.output.response}}\n\nRespond with ONLY a valid JSON object of the format `{\"priority_topics\": [{\"topic\": \"\", \"reason\": \"\"}], \"action_items\": [{\"task\": \"\", \"resource_link\": \"\"}]}`."
-      }
+        "prompt": "Based on the following AI trend analysis, create a practical, actionable learning plan for an AI developer/researcher for the upcoming week.\n\nFor each major trend or important development:\n- Suggest ONE concrete action item (e.g., 'Read paper X and implement key algorithm', 'Explore repo Y and run examples', 'Study model Z architecture')\n- Provide specific resource links when available\n- Prioritize items by learning value and time investment\n\n**Trend Analysis:**\n{{analyze_trends_and_rank.output.response}}\n\nRespond with ONLY a valid JSON object in this exact format:\n```json\n{\n  \"priority_topics\": [\n    {\n      \"topic\": \"Topic name\",\n      \"reason\": \"Why this topic is important to learn now\",\n      \"difficulty\": \"beginner|intermediate|advanced\"\n    }\n  ],\n  \"action_items\": [\n    {\n      \"task\": \"Specific action to take\",\n      \"resource_link\": \"URL to paper/repo/model\",\n      \"estimated_time\": \"Time estimate (e.g., '2 hours', '1 day')\",\n      \"priority\": \"high|medium|low\"\n    }\n  ]\n}\n```"
+      },
+      "step_id": "generate_learning_plan",
+      "return_as_final_answer": false
     },
     {
       "type": "action",
-      "step_id": "generate_weekly_report",
+      "action": "execute_command",
+      "inputs": {
+        "command": "date +'%Y-W%V' | tr -d '\\n'",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "get_week_identifier",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
       "action": "generate_text_response",
       "inputs": {
-        "prompt": "Combine the trend analysis and learning plan into a single, polished weekly report in Markdown format. The title should be 'AI Frontier Weekly Report - Week {{current_date('W')}}, {{current_date('YYYY')}}'.\n\nAnalysis Content:\n{{analyze_trends_and_rank.output.response}}\n\nLearning Plan JSON:\n{{json.dumps(generate_learning_plan.output.response)}}"
-      }
+        "prompt": "Create a polished, professional weekly report combining the trend analysis and learning plan below. Use this structure:\n\n# \ud83d\ude80 AI Frontier Weekly Report\n## Week {{get_week_identifier.output.stdout}}\n\n### \ud83d\udcca Executive Summary\n[2-3 sentence overview of the week's most important developments]\n\n### \ud83d\udd25 Top Trends\n[Insert trend analysis here with proper formatting]\n\n### \u2b50 Spotlight: Top 5 Developments\n[Insert ranked items with scores and analysis]\n\n### \ud83d\udcda Learning Plan for Next Week\n#### Priority Topics\n[Format the priority_topics from JSON as a clear list]\n\n#### Action Items\n[Format the action_items from JSON as a checklist with links]\n\n### \ud83d\udcc8 Statistics\n- Total Papers Tracked: [count from data]\n- Total GitHub Repos: [count from data]\n- Total Models: [count from data]\n- Total HN Stories: [count from data]\n\n---\n*Generated on {{get_week_identifier.output.stdout}} | Powered by AI Workflow Platform*\n\n**Trend Analysis:**\n{{analyze_trends_and_rank.output.response}}\n\n**Learning Plan (JSON):**\n```json\n{{generate_learning_plan.output.response}}\n```\n\n**Raw Data Summary:**\n```json\n{{aggregate_weekly_data.output.stdout}}\n```"
+      },
+      "step_id": "generate_weekly_report",
+      "return_as_final_answer": false
     },
     {
       "type": "action",
-      "step_id": "save_and_notify_report",
+      "action": "execute_command",
+      "inputs": {
+        "command": "echo '{{generate_learning_plan.output.response}}' | python3 -c 'import sys, json; data = json.load(sys.stdin); print(json.dumps(data, indent=2, ensure_ascii=False))'",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "serialize_learning_plan",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
       "action": "write_files",
       "inputs": {
-        "environment_id": "{{environment_id}}",
-        "files": [{
-            "filepath": "/reports/weekly_report_{{current_date('YYYY')}}_W{{current_date('W')}}.md",
-            "content": "{{generate_weekly_report.output.response}}"
-        }]
+        "files": [
+          {
+            "content": "{{generate_weekly_report.output.response}}",
+            "filepath": "data/weekly/report_{{get_week_identifier.output.stdout}}.md"
+          },
+          {
+            "content": "{{serialize_learning_plan.output.stdout}}",
+            "filepath": "data/weekly/learning_plan_{{get_week_identifier.output.stdout}}.json"
+          },
+          {
+            "content": "{{aggregate_weekly_data.output.stdout}}",
+            "filepath": "data/weekly/aggregated_data_{{get_week_identifier.output.stdout}}.json"
+          }
+        ],
+        "environment_id": "{{environment_id}}"
       },
+      "step_id": "save_weekly_outputs",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "execute_command",
+      "inputs": {
+        "command": "sudo cp -r data /host/",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "copy_to_host",
       "return_as_final_answer": true
     }
   ]
@@ -168,50 +284,239 @@
 
 ```json
 {
+  "name": "AI Topic Deep Dive Research",
   "steps": [
     {
       "type": "action",
-      "step_id": "search_papers_for_topic",
       "action": "execute_command",
       "inputs": {
-        "environment_id": "{{environment_id}}",
-        "command": "YOUR_ARXIV_SEARCH_SCRIPT '{{task_topic}}'" 
-      }
+        "command": "echo '{{task}}' | python3 -c \"import sys, re, json; task=sys.stdin.read().strip(); match=re.search(r'[\\'\\\"](.+?)[\\'\\\"]', task); topic=match.group(1) if match else task.replace('Deep dive on ', '').replace('deep dive on ', ''); print(json.dumps({'topic': topic, 'slug': re.sub(r'[^a-z0-9]+', '_', topic.lower()).strip('_')}, ensure_ascii=False), end='')\" | tr -d '\\n'",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "validate_and_extract_topic",
+      "return_as_final_answer": false
     },
     {
       "type": "action",
-      "step_id": "summarize_key_papers",
-      "action": "process_chunks_with_ai",
+      "action": "execute_command",
       "inputs": {
-        "chunks": "{{search_papers_for_topic.output.response.papers}}",
-        "prompt_template": "Read the summary of the paper titled '{{chunk.title}}'. Explain its core contribution, methodology, and key results in 3 bullet points. Paper Summary: {{chunk.summary}}",
-        "output_format": "text"
-      }
+        "command": "mkdir -p data/study_guides data/deep_dive",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "create_directories",
+      "return_as_final_answer": false
     },
     {
       "type": "action",
-      "step_id": "generate_starter_code",
+      "action": "execute_command",
+      "inputs": {
+        "command": "TOPIC=$(echo '{{validate_and_extract_topic.output.stdout}}' | python3 -c 'import sys, json; print(json.loads(sys.stdin.read())[\"topic\"], end=\"\")'); bash sandbox_service/app/tools/search_arxiv_topic.sh \"$TOPIC\" 10",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "search_arxiv_papers",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "execute_command",
+      "inputs": {
+        "command": "TOPIC=$(echo '{{validate_and_extract_topic.output.stdout}}' | python3 -c 'import sys, json; print(json.loads(sys.stdin.read())[\"topic\"], end=\"\")'); bash sandbox_service/app/tools/search_github_repos.sh \"$TOPIC\" 5",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "search_github_repos",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
       "action": "generate_text_response",
       "inputs": {
-        "prompt": "Based on the key concepts from the following paper summaries, generate a minimal, runnable Python code example demonstrating the core idea of '{{task_topic}}'. Include necessary library imports and comments.\n\nSummaries:\n{{json.dumps(summarize_key_papers.output.processed_chunks)}}"
-      }
+        "prompt": "You are an expert AI researcher. Analyze the following research papers on the topic from the research data below.\n\n**Topic Extraction Output:**\n{{validate_and_extract_topic.output.stdout}}\n\n**Papers Data:**\n```json\n{{search_arxiv_papers.output.stdout}}\n```\n\nFirst, extract the topic name from the Topic Extraction Output JSON, then provide:\n1. **Core Concepts Summary** (3-5 key ideas that define this topic)\n2. **Top 3 Must-Read Papers** (with title, why it's important, and key takeaway)\n3. **Technical Challenges** (what are the hard problems in this area)\n4. **Current State-of-the-Art** (what approaches are winning)\n\nFormat in clear Markdown with sections."
+      },
+      "step_id": "analyze_papers_with_ai",
+      "return_as_final_answer": false
     },
     {
       "type": "action",
-      "step_id": "create_study_guide",
+      "action": "generate_text_response",
+      "inputs": {
+        "prompt": "You are a senior AI engineer. The topic extraction output is:\n\n{{validate_and_extract_topic.output.stdout}}\n\nAnalyze these GitHub repositories:\n\n```json\n{{search_github_repos.output.stdout}}\n```\n\nFirst extract the topic from the JSON above, then provide:\n1. **Ecosystem Overview** (what kinds of tools/libraries exist)\n2. **Top 2 Recommended Repos** (which ones to explore first and why)\n3. **Implementation Patterns** (common approaches you see in the codebases)\n\nBe concise and practical."
+      },
+      "step_id": "analyze_github_ecosystem",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "generate_structured_data",
+      "inputs": {
+        "prompt": "Based on the research above, create a structured learning roadmap.\n\n**Topic Info:**\n{{validate_and_extract_topic.output.stdout}}\n\n**Paper Analysis:**\n{{analyze_papers_with_ai.output.response}}\n\n**GitHub Ecosystem:**\n{{analyze_github_ecosystem.output.response}}\n\nFirst extract the topic name from the Topic Info JSON, then respond with ONLY valid JSON in this format:\n```json\n{\n  \"topic\": \"extracted topic name\",\n  \"prerequisites\": [\"concept1\", \"concept2\"],\n  \"learning_path\": [\n    {\n      \"phase\": \"1. Foundations\",\n      \"goals\": [\"goal1\", \"goal2\"],\n      \"resources\": [{\"type\": \"paper|repo|tutorial\", \"title\": \"...\", \"url\": \"...\"}],\n      \"estimated_time\": \"X hours/days\"\n    }\n  ],\n  \"hands_on_projects\": [\n    {\"title\": \"project name\", \"description\": \"what to build\", \"difficulty\": \"beginner|intermediate|advanced\"}\n  ]\n}\n```"
+      },
+      "step_id": "generate_learning_roadmap",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "generate_text_response",
+      "inputs": {
+        "prompt": "You are a Python expert. Based on the following research, write a complete, runnable Python code example that demonstrates the CORE concept.\n\n**Topic Info:**\n{{validate_and_extract_topic.output.stdout}}\n\nRequirements:\n- Include all necessary imports\n- Use only common libraries (transformers, torch, numpy, etc.)\n- Add detailed comments explaining each step\n- Keep it under 100 lines but fully functional\n- Include a simple usage example at the end\n\n**Research Context:**\n{{analyze_papers_with_ai.output.response}}\n\n**Available Libraries (from GitHub):**\n{{analyze_github_ecosystem.output.response}}\n\nFirst extract the topic from the Topic Info JSON, then provide ONLY the Python code, no explanations before or after."
+      },
+      "step_id": "generate_starter_code",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "execute_command",
+      "inputs": {
+        "command": "echo '{{validate_and_extract_topic.output.stdout}}' | python3 -c 'import sys, json; data=json.loads(sys.stdin.read()); print(data[\"topic\"], end=\"\")' | tr -d '\\n'",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "extract_topic_name",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "execute_command",
+      "inputs": {
+        "command": "echo '{{validate_and_extract_topic.output.stdout}}' | python3 -c 'import sys, json; data=json.loads(sys.stdin.read()); print(data[\"slug\"], end=\"\")' | tr -d '\\n'",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "extract_slug",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "generate_text_response",
+      "inputs": {
+        "prompt": "Compile everything into a polished study guide.\n\n**Topic:** {{extract_topic_name.output.stdout}}\n\nUse this structure:\n\n```markdown\n# 📚 Deep Dive Study Guide: {{extract_topic_name.output.stdout}}\n\n> Generated on $(date +%Y-%m-%d) | Research Depth: Comprehensive\n\n## 🎯 What You'll Learn\n[2-3 sentence overview of what this topic is and why it matters]\n\n## 🧠 Core Concepts\n[Insert paper analysis core concepts section]\n\n## 📖 Essential Reading\n[Insert top papers from analysis]\n\n## 💻 GitHub Ecosystem\n[Insert GitHub analysis]\n\n## 🗺️ Learning Roadmap\n[Format the JSON roadmap as readable sections with checkboxes]\n\n## 🔬 Hands-On: Starter Code\n[Insert the generated Python code in a code block]\n\n### How to Run\n```bash\npip install [required libraries]\npython starter_code.py\n```\n\n## 🚀 Next Steps\n- [ ] Read the top 3 papers\n- [ ] Clone and explore recommended repos\n- [ ] Modify the starter code for your use case\n- [ ] Build one of the hands-on projects\n\n## 📚 Additional Resources\n- Official documentation links\n- Community forums\n- Related topics to explore next\n\n---\n*This guide was generated by AI Workflow Platform's Deep Dive system*\n```\n\n**Data to integrate:**\n\nPaper Analysis:\n{{analyze_papers_with_ai.output.response}}\n\nGitHub Analysis:\n{{analyze_github_ecosystem.output.response}}\n\nLearning Roadmap JSON:\n```json\n{{generate_learning_roadmap.output.response}}\n```\n\nStarter Code:\n```python\n{{generate_starter_code.output.response}}\n```\n\nProvide the complete, formatted study guide."
+      },
+      "step_id": "create_comprehensive_study_guide",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
       "action": "write_files",
       "inputs": {
-        "environment_id": "{{environment_id}}",
-        "files": [{
-          "filepath": "/study_guides/{{task_topic_slug}}.md",
-          "content": "# Study Guide: {{task_topic}}\n\n## Key Papers & Summaries\n{{...}}\n\n## Core Concepts\n{{...}}\n\n## Starter Code Example\n```python\n{{generate_starter_code.output.response}}\n```"
-        }]
+        "files": [
+          {
+            "content": "{{create_comprehensive_study_guide.output.response}}",
+            "filepath": "data/study_guides/{{extract_slug.output.stdout}}.md"
+          }
+        ],
+        "environment_id": "{{environment_id}}"
       },
+      "step_id": "save_study_guide",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "write_files",
+      "inputs": {
+        "files": [
+          {
+            "content": "{{generate_starter_code.output.response}}",
+            "filepath": "data/study_guides/{{extract_slug.output.stdout}}_code.py"
+          }
+        ],
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "save_starter_code",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "generate_text_response",
+      "inputs": {
+        "prompt": "Convert the following data to properly formatted JSON string. If it's already JSON, return it as-is. If it's a Python dict/object representation, convert it to valid JSON.\n\nData:\n{{generate_learning_roadmap.output.response}}\n\nReturn ONLY the JSON string, no explanations."
+      },
+      "step_id": "format_roadmap_json",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "write_files",
+      "inputs": {
+        "files": [
+          {
+            "content": "{{format_roadmap_json.output.response}}",
+            "filepath": "data/deep_dive/{{extract_slug.output.stdout}}_roadmap.json"
+          }
+        ],
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "save_roadmap_json",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "write_files",
+      "inputs": {
+        "files": [
+          {
+            "content": "{{search_arxiv_papers.output.stdout}}",
+            "filepath": "data/deep_dive/{{extract_slug.output.stdout}}_papers.json"
+          }
+        ],
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "save_papers_json",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "write_files",
+      "inputs": {
+        "files": [
+          {
+            "content": "{{search_github_repos.output.stdout}}",
+            "filepath": "data/deep_dive/{{extract_slug.output.stdout}}_repos.json"
+          }
+        ],
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "save_repos_json",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "execute_command",
+      "inputs": {
+        "command": "sudo cp -r data /host/",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "copy_to_host",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "execute_command",
+      "inputs": {
+        "command": "echo '{{search_arxiv_papers.output.stdout}}' | python3 -c 'import sys, json; data=json.loads(sys.stdin.read()); print(len(data.get(\"papers\", [])), end=\"\")' | tr -d '\\n'",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "count_papers",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "execute_command",
+      "inputs": {
+        "command": "echo '{{search_github_repos.output.stdout}}' | python3 -c 'import sys, json; data=json.loads(sys.stdin.read()); print(len(data) if isinstance(data, list) else 0, end=\"\")' | tr -d '\\n'",
+        "environment_id": "{{environment_id}}"
+      },
+      "step_id": "count_repos",
+      "return_as_final_answer": false
+    },
+    {
+      "type": "action",
+      "action": "generate_text_response",
+      "inputs": {
+        "prompt": "Create a concise executive summary of the deep dive research completed.\n\n**Topic:** {{extract_topic_name.output.stdout}}\n\n**Outputs Generated:**\n- Study Guide: data/study_guides/{{extract_slug.output.stdout}}.md\n- Starter Code: data/study_guides/{{extract_slug.output.stdout}}_code.py\n- Learning Roadmap: data/deep_dive/{{extract_slug.output.stdout}}_roadmap.json\n\n**Research Stats:**\n- Papers Analyzed: {{count_papers.output.stdout}}\n- Repos Reviewed: {{count_repos.output.stdout}}\n\nProvide:\n1. 🎯 **Key Insight** (one sentence: what's the most important thing to know)\n2. ⚡ **Quick Start** (what to do first to begin learning)\n3. 📊 **Complexity Rating** (beginner/intermediate/advanced and why)\n4. 🔗 **All Generated Files** (list with descriptions)\n\nKeep it under 200 words, actionable and encouraging."
+      },
+      "step_id": "generate_summary_report",
       "return_as_final_answer": true
     }
-  ]
+  ],
+  "description": "Comprehensive research workflow for any AI topic: search papers, analyze repos, generate study guide with code examples"
 }
-
 ```
 
 ### 4. 实施路线图 (Roadmap)
@@ -243,3 +548,4 @@
 *   ✅ **每周1小时**，获得一份包含深刻洞察和定制化学习路径的深度报告。
 *   ✅ **按需启动**，即可在数分钟内获得任何一个AI新主题的完整学习入门包。
 *   ✅ **真正实现**“让AI为你工作”，将你的时间和精力聚焦于最高价值的创造性活动上。
+```
