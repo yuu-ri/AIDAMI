@@ -1,4 +1,4 @@
-# AIDAMI 事業計画書（JETRO提出用・目標現実化修正版）
+# AIDAMI 事業計画書
 
 **バージョン：** 2.1.0  
 **日付：** 2026年1月4日  
@@ -198,3 +198,4 @@ AIDAMIは、AIを中核とした開発者向け軽量SaaSプラットフォー�
 - 希望相談先：JETRO Invest Japan Business Support Center（IBSC）横浜  
 
 ---
+
