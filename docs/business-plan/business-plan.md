@@ -4,7 +4,7 @@
 **日付：** 2026年1月4日  
 **事業者名：** 李 勇  
 **連絡先：** liyongpublic@gmail.com  
-**電話番号：** 08057793614  
+**電話番号：**
 **住所：** 日本神奈川県横浜市南区  
 **国籍：** 日本  
 **ウェブサイト：** AIDAMI.dev（開発中）
@@ -198,5 +198,6 @@ AIDAMIは、AIを中核とした開発者向け軽量SaaSプラットフォー�
 - 希望相談先：JETRO Invest Japan Business Support Center（IBSC）横浜  
 
 ---
+
 
 
