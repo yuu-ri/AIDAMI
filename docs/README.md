@@ -4,6 +4,8 @@ AIDAMI
 ├── docs/ 
 │   ├── README.md              
 │   ├── roadmap.md             
+│   ├── education/
+│   │   └── AI_Textbook_for_Non_AI_Majors.md
 │   ├── requirements/          
 │   │   ├── feature-list.md      
 │   │   └── user-stories.md      
