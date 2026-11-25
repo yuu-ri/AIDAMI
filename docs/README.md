@@ -4,6 +4,8 @@ AIDAMI
 ├── docs/ 
 │   ├── README.md              
 │   ├── roadmap.md             
+│   ├── education/
+│   │   └── AI_Learning_Mechanism_Math_Primer.md
 │   ├── requirements/          
 │   │   ├── feature-list.md      
 │   │   └── user-stories.md      
